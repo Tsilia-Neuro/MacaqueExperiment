@@ -1,4 +1,3 @@
-
 import time
 import random
 import csv
@@ -46,9 +45,9 @@ ANGLE_M2 = 90
 # ----------------------------
 STEPS_PER_REV = 2048
 STEPS_90_DEG = 1024              # Quarter turn
-STEPPER_TEST_STEPS = 128        # Small visible test at startup
-STEPPER_MAX_SPEED = 180         # Reduced speed for reliability
-STEPPER_ACCELERATION = 80       # Reduced acceleration for reliability
+STEPPER_TEST_STEPS = 128         # Small visible test at startup
+STEPPER_MAX_SPEED = 180          # Reduced speed for reliability
+STEPPER_ACCELERATION = 80        # Reduced acceleration for reliability
 STEPPER_TIMEOUT_SEC = 8.0
 
 RUN_STEPPER_TEST_AT_STARTUP = True
@@ -96,7 +95,6 @@ class MacaqueExperiment:
         logging.info("Initializing experiment and connecting to board...")
 
         try:
-            # port=None => auto-detect Arduino serial port
             self.board = telemetrix.Telemetrix(com_port=port, arduino_wait=8)
         except Exception as e:
             logging.exception(f"Unable to connect to Arduino/Telemetrix: {e}")
@@ -104,15 +102,21 @@ class MacaqueExperiment:
 
         # Trial/session state
         self.in_trial = False
+        self.in_iti = False
         self.active_side = None              # "M1" or "M2"
         self.correct_button_pin = None
         self.correct_led_pin = None
 
         self.trial_start_perf = None
         self.trial_start_timestamp = None
+        self.stimulus_on_timestamp = None
+        self.button_press_timestamp = None
+        self.reward_delivery_timestamp = None
 
         self.button_pressed = False
         self.wrong_button_pressed = False
+        self.omission = False
+        self.premature_iti_presses = 0
         self.pressed_pin = None
         self.reaction_time_ms = int(TRIAL_DURATION_SEC * 1000)
 
@@ -134,6 +138,12 @@ class MacaqueExperiment:
         self.setup_hardware()
 
     # --------------------------------------------------------
+    # Timestamp helper
+    # --------------------------------------------------------
+    def current_timestamp(self):
+        return datetime.now().isoformat(sep=" ", timespec="milliseconds")
+
+    # --------------------------------------------------------
     # Mapping helpers
     # --------------------------------------------------------
     def button_pin_for_side(self, side):
@@ -147,6 +157,19 @@ class MacaqueExperiment:
 
     def other_side(self, side):
         return "M2" if side == "M1" else "M1"
+
+    # --------------------------------------------------------
+    # Reward rule helper
+    # --------------------------------------------------------
+    def get_reward_recipient(self):
+        """
+        Reward rule:
+        - If the tested macaque presses the correct button, reward goes to the tested macaque.
+        - If the tested macaque does not press the correct button, reward goes to the other macaque.
+        """
+        if self.button_pressed:
+            return self.active_side
+        return self.other_side(self.active_side)
 
     # --------------------------------------------------------
     # Hardware setup
@@ -164,16 +187,12 @@ class MacaqueExperiment:
         self.board.digital_write(PIN_LED_M2, 0)
 
         # Servo
-        # Telemetrix exposes set_pin_mode_servo(...) then servo_write(...)
-        # for servo control. [4](https://mryslab.github.io/telemetrix/pin_modes/)
         self.board.set_pin_mode_servo(PIN_SERVO, 100, 3000)
         time.sleep(0.2)
         self.board.servo_write(PIN_SERVO, ANGLE_CENTER)
         time.sleep(0.5)
 
-        # Stepper (28BYJ-48 + ULN2003)
-        # Telemetrix examples for 28BYJ-48 + ULN2003 use interface=4
-        # and keep the returned motor id for later commands. [1](https://pypi.org/project/telemetrix-aio/)
+        # Stepper
         self.motor_id = self.board.set_pin_mode_stepper(
             interface=4,
             pin1=PIN_STEPPER[0],
@@ -183,15 +202,12 @@ class MacaqueExperiment:
         )
         time.sleep(0.2)
 
-        # Safer speed/acceleration for 28BYJ-48
         self.board.stepper_set_max_speed(self.motor_id, STEPPER_MAX_SPEED)
         self.board.stepper_set_acceleration(self.motor_id, STEPPER_ACCELERATION)
         self.board.stepper_set_current_position(self.motor_id, 0)
         time.sleep(0.2)
 
         # Buttons with pull-up callbacks
-        # Telemetrix digital inputs report via callbacks:
-        # [pin_type, pin_number, pin_value, raw_timestamp]. [5](https://github.com/MrYsLab/telemetrix/blob/master/examples/stepper_absolute.py)[3](https://github.com/MrYsLab/telemetrix/blob/master/examples/servo.py)
         self.board.set_pin_mode_digital_input_pullup(PIN_BTN_M1, callback=self.button_callback)
         time.sleep(0.05)
         self.board.set_pin_mode_digital_input_pullup(PIN_BTN_M2, callback=self.button_callback)
@@ -222,6 +238,66 @@ class MacaqueExperiment:
             time.sleep(0.01)
 
     # --------------------------------------------------------
+    # Button event processing
+    # --------------------------------------------------------
+    def process_button_press(self, pin_number):
+        """
+        Processes a confirmed press transition on a button.
+        This function is called only when the input changes from released=1 to pressed=0.
+        """
+        button_event_timestamp = self.current_timestamp()
+
+        logging.info(
+            f"Button press transition detected on pin {pin_number} | "
+            f"in_iti={self.in_iti} | in_trial={self.in_trial} | "
+            f"active_side={self.active_side} | "
+            f"correct_button_pin={self.correct_button_pin} | "
+            f"Timestamp={button_event_timestamp}"
+        )
+
+        # Premature ITI press
+        if self.in_iti and not self.in_trial:
+            self.premature_iti_presses += 1
+            logging.info(
+                f"Premature ITI button press detected on pin {pin_number} | "
+                f"Premature_ITI_Presses = {self.premature_iti_presses}"
+            )
+            return
+
+        # Outside trial and outside ITI => ignore for experimental scoring
+        if not self.in_trial:
+            return
+
+        # Store timestamp of the first button press during the trial
+        if self.button_press_timestamp is None:
+            self.button_press_timestamp = button_event_timestamp
+
+        # Correct button = same side as the tested macaque / lit LED
+        if pin_number == self.correct_button_pin and not self.button_pressed:
+            self.reaction_time_ms = int((time.perf_counter() - self.trial_start_perf) * 1000)
+            self.button_pressed = True
+            self.pressed_pin = pin_number
+
+            logging.info(
+                f"[{self.active_side}] Correct button press detected "
+                f"on pin {pin_number} at {self.reaction_time_ms} ms | "
+                f"Button_Press_Timestamp = {button_event_timestamp}"
+            )
+
+            # Immediate visual feedback
+            self.board.digital_write(self.correct_led_pin, 0)
+
+        # Wrong button = ignored for reward, but logged
+        elif pin_number != self.correct_button_pin:
+            self.wrong_button_pressed = True
+
+            logging.info(
+                f"[{self.active_side}] Wrong button pressed on pin {pin_number} | "
+                f"Expected correct pin = {self.correct_button_pin} | "
+                f"Button_Press_Timestamp = {button_event_timestamp} (ignored for reward)."
+            )
+
+    # --------------------------------------------------------
     # Button callback
     # --------------------------------------------------------
     def button_callback(self, data):
@@ -240,36 +316,17 @@ class MacaqueExperiment:
             logging.warning(f"Unexpected callback format: {data}")
             return
 
-        # Keep current physical state
-        if pin_number in self.btn_state:
-            self.btn_state[pin_number] = pin_value
-
-        # Outside trial => state tracking only
-        if not self.in_trial:
+        if pin_number not in self.btn_state:
             return
 
-        # Count only NEW press events
-        if pin_value == 0:
-            # Correct button = same side as the lit LED
-            if pin_number == self.correct_button_pin and not self.button_pressed:
-                self.reaction_time_ms = int((time.perf_counter() - self.trial_start_perf) * 1000)
-                self.button_pressed = True
-                self.pressed_pin = pin_number
+        previous_pin_value = self.btn_state[pin_number]
 
-                logging.info(
-                    f"[{self.active_side}] Correct button press detected "
-                    f"on pin {pin_number} at {self.reaction_time_ms} ms"
-                )
+        # Keep current physical state
+        self.btn_state[pin_number] = pin_value
 
-                # Immediate visual feedback
-                self.board.digital_write(self.correct_led_pin, 0)
-
-            # Wrong button = ignored
-            elif pin_number != self.correct_button_pin:
-                self.wrong_button_pressed = True
-                logging.info(
-                    f"[{self.active_side}] Wrong button pressed on pin {pin_number} (ignored)."
-                )
+        # Count only NEW press events: released=1 -> pressed=0
+        if previous_pin_value == 1 and pin_value == 0:
+            self.process_button_press(pin_number)
 
     # --------------------------------------------------------
     # Stepper callback
@@ -287,7 +344,6 @@ class MacaqueExperiment:
 
         self.stepper_done = False
         self.board.stepper_move(self.motor_id, STEPPER_TEST_STEPS)
-        # stepper_run starts the motion and can report completion via callback. [2](https://mryslab.github.io/telemetrix-rpi-pico-w/stepper/)[1](https://pypi.org/project/telemetrix-aio/)
         self.board.stepper_run(self.motor_id, completion_callback=self.stepper_completion_callback)
 
         start_wait = time.perf_counter()
@@ -303,7 +359,12 @@ class MacaqueExperiment:
     # Reward delivery
     # --------------------------------------------------------
     def dispense_food(self, target_side):
-        logging.info(f"Dispensing food to {target_side}...")
+        self.reward_delivery_timestamp = self.current_timestamp()
+
+        logging.info(
+            f"Dispensing food to {target_side}... | "
+            f"Reward_Delivery_Timestamp = {self.reward_delivery_timestamp}"
+        )
 
         # 1) Point servo to target side
         target_angle = self.servo_angle_for_side(target_side)
@@ -337,13 +398,18 @@ class MacaqueExperiment:
             writer = csv.writer(file)
             writer.writerow([
                 "Trial_Start_Timestamp",
+                "Stimulus_ON_Timestamp",
+                "Button_Press_Timestamp",
+                "Reward_Delivery_Timestamp",
                 "Session_ID",
                 "Trial_Num",
                 "Active_Side",
                 "Wall_Present",
                 "ITI_sec",
+                "Premature_ITI_Presses",
                 "Pressed_Correct",
                 "Wrong_Button_Pressed",
+                "Omission",
                 "Latency_ms",
                 "Reward_Recipient"
             ])
@@ -355,13 +421,18 @@ class MacaqueExperiment:
             writer = csv.writer(file)
             writer.writerow([
                 self.trial_start_timestamp,
+                self.stimulus_on_timestamp,
+                self.button_press_timestamp,
+                self.reward_delivery_timestamp,
                 session_id,
                 trial_num,
                 self.active_side,
                 wall_present,
                 iti_sec,
+                self.premature_iti_presses,
                 1 if self.button_pressed else 0,
                 1 if self.wrong_button_pressed else 0,
+                1 if self.omission else 0,
                 self.reaction_time_ms,
                 reward_recipient
             ])
@@ -373,6 +444,9 @@ class MacaqueExperiment:
         logging.info("")
         logging.info(f"=== STARTING SESSION: {session_id} ===")
         logging.info(f"Target side: {macaque_to_test} | Wall present: {wall_present}")
+
+        if macaque_to_test not in ("M1", "M2"):
+            raise ValueError("macaque_to_test must be 'M1' or 'M2'")
 
         self.create_session_file(session_id)
 
@@ -387,9 +461,19 @@ class MacaqueExperiment:
             # ITI
             # ----------------------------
             iti_sec = random.randint(MIN_ITI, MAX_ITI)
+            self.premature_iti_presses = 0
+            self.in_iti = True
+
             logging.info(f"--- Trial {trial}/{NUM_TRIALS} ---")
             logging.info(f"ITI = {iti_sec} s")
+
             self.safe_sleep(iti_sec)
+
+            self.in_iti = False
+
+            logging.info(
+                f"ITI complete | Premature_ITI_Presses = {self.premature_iti_presses}"
+            )
 
             # ----------------------------
             # Trial init
@@ -400,19 +484,29 @@ class MacaqueExperiment:
 
             self.button_pressed = False
             self.wrong_button_pressed = False
+            self.omission = False
             self.pressed_pin = None
             self.reaction_time_ms = int(TRIAL_DURATION_SEC * 1000)
+
+            self.trial_start_timestamp = None
+            self.stimulus_on_timestamp = None
+            self.button_press_timestamp = None
+            self.reward_delivery_timestamp = None
+
+            self.trial_start_perf = time.perf_counter()
+            self.in_trial = True
 
             # Light the LED for the same side whose button must be pressed
             self.light_only_led_for_side(self.active_side)
 
-            self.trial_start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.trial_start_perf = time.perf_counter()
-            self.in_trial = True
+            self.stimulus_on_timestamp = self.current_timestamp()
+            self.trial_start_timestamp = self.stimulus_on_timestamp
 
             logging.info(
-                f"Stimulus ON. LED side = {self.active_side} | "
-                f"Correct button pin = {self.correct_button_pin}"
+                f"Stimulus ON. Tested side = {self.active_side} | "
+                f"LED side = {self.active_side} | "
+                f"Correct button pin = {self.correct_button_pin} | "
+                f"Stimulus_ON_Timestamp = {self.stimulus_on_timestamp}"
             )
 
             # Mandatory 10-second window
@@ -422,19 +516,23 @@ class MacaqueExperiment:
             self.in_trial = False
             self.leds_off()
 
+            # Omission = no correct and no wrong button press during the trial
+            self.omission = not self.button_pressed and not self.wrong_button_pressed
+
             # ----------------------------
             # Reward logic
-            # If the correct button was NOT pressed,
-            # reward goes to the other macaque.
+            # Rule:
+            # - Correct press by tested macaque => reward tested macaque.
+            # - No correct press => reward other macaque.
             # ----------------------------
-            if self.button_pressed:
-                reward_recipient = self.active_side
-            else:
-                reward_recipient = self.other_side(self.active_side)
+            reward_recipient = self.get_reward_recipient()
 
             logging.info(
-                f"End of trial: button_pressed={self.button_pressed} "
-                f"=> reward_recipient={reward_recipient}"
+                f"Reward decision | tested_macaque={self.active_side} | "
+                f"button_pressed={self.button_pressed} | "
+                f"wrong_button_pressed={self.wrong_button_pressed} | "
+                f"omission={self.omission} | "
+                f"reward_recipient={reward_recipient}"
             )
 
             self.dispense_food(reward_recipient)
@@ -449,10 +547,15 @@ class MacaqueExperiment:
             )
 
             logging.info(
-                f"Trial {trial} saved | LED/Button side: {self.active_side} | "
+                f"Trial {trial} saved | Tested side: {self.active_side} | "
                 f"Correct press: {self.button_pressed} | "
                 f"Wrong press: {self.wrong_button_pressed} | "
+                f"Omission: {self.omission} | "
+                f"Premature ITI presses: {self.premature_iti_presses} | "
                 f"Latency: {self.reaction_time_ms} ms | "
+                f"Stimulus_ON_Timestamp: {self.stimulus_on_timestamp} | "
+                f"Button_Press_Timestamp: {self.button_press_timestamp} | "
+                f"Reward_Delivery_Timestamp: {self.reward_delivery_timestamp} | "
                 f"Reward given to: {reward_recipient}"
             )
 
@@ -485,7 +588,7 @@ if __name__ == "__main__":
 
         experiment.run_session(
             session_id="SESS_001",
-            macaque_to_test="M1",   # Change to "M2" if needed
+            macaque_to_test="M1",   # Change to "M2" to test M2
             wall_present=False
         )
 
