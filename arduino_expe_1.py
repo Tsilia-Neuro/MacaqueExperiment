@@ -20,7 +20,26 @@ TRIAL_DURATION_SEC = 10.0         # Mandatory 10-second window
 
 # Short ITI values for testing
 MIN_ITI = 5
-MAX_ITI = 15
+MAX_ITI = 10
+
+# ----------------------------
+# Trial polling
+# ----------------------------
+TRIAL_POLL_INTERVAL_SEC = 0.005
+
+# ----------------------------
+# Reward timing configuration
+# ----------------------------
+USE_RANDOM_REWARD_DELAYS = False
+
+SERVO_DELAY_FIXED_SEC = 1.0       # Servo starts 1.0 s after correct press
+STEPPER_DELAY_FIXED_SEC = 1.2     # Stepper starts 1.2 s after correct press
+SERVO_HOLD_FIXED_SEC = 4.0        # Servo stays at target position for 4.0 s
+
+# Example ranges for future random delays
+SERVO_DELAY_RANGE_SEC = (0.8, 1.5)
+STEPPER_DELAY_RANGE_SEC = (1.0, 1.8)
+SERVO_HOLD_RANGE_SEC = (3.5, 4.5)
 
 # ----------------------------
 # Hardware pins
@@ -31,6 +50,18 @@ PIN_BTN_M2 = 5
 PIN_LED_M1 = 6
 PIN_LED_M2 = 7
 PIN_STEPPER = [8, 9, 10, 11]  # IN1, IN2, IN3, IN4
+
+PIN_BUZZER = 12
+BUZZER_FREQUENCY_HZ = 1000
+
+# Short stimulus beep duration
+BUZZER_DURATION_MS = 1000
+
+# Long beep after correct press
+CORRECT_PRESS_BUZZER_DURATION_MS = 2000
+
+# Silence gap when the correct press happens during the first beep
+BUZZER_SWITCH_GAP_MS = 200
 
 # ----------------------------
 # Servo angles
@@ -44,10 +75,10 @@ ANGLE_M2 = 90
 # 28BYJ-48 + ULN2003
 # ----------------------------
 STEPS_PER_REV = 2048
-STEPS_90_DEG = 1024              # Quarter turn
-STEPPER_TEST_STEPS = 128         # Small visible test at startup
-STEPPER_MAX_SPEED = 180          # Reduced speed for reliability
-STEPPER_ACCELERATION = 80        # Reduced acceleration for reliability
+STEPS_90_DEG = 300
+STEPPER_TEST_STEPS = 20
+STEPPER_MAX_SPEED = 260
+STEPPER_ACCELERATION = 140
 STEPPER_TIMEOUT_SEC = 8.0
 
 RUN_STEPPER_TEST_AT_STARTUP = True
@@ -59,12 +90,16 @@ RUN_STEPPER_TEST_AT_STARTUP = True
 
 def setup_environment():
     """
-    Creates the data folder on Desktop (or Bureau) and configures logging.
+    Creates the data folder on Desktop or Bureau and configures logging.
     """
     home = Path.home()
     desktop = home / "Desktop"
+
     if not desktop.exists():
         desktop = home / "Bureau"
+
+    if not desktop.exists():
+        desktop = home
 
     data_dir = desktop / DATA_FOLDER_NAME
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +120,41 @@ def setup_environment():
 
 
 # ============================================================
+# OPERATOR INPUT HELPERS
+# ============================================================
+
+def ask_macaque():
+    while True:
+        answer = input("Which macaque is being tested? [M1/M2]: ").strip().upper()
+        if answer in {"M1", "M2"}:
+            return answer
+        print("Invalid value. Please enter exactly 'M1' or 'M2'.")
+
+
+def ask_wall_present():
+    valid_true = {"YES", "Y", "TRUE", "T", "1", "OUI"}
+    valid_false = {"NO", "N", "FALSE", "F", "0", "NON"}
+
+    while True:
+        answer = input("Is the wall present? [Yes/No]: ").strip().upper()
+        if answer in valid_true:
+            return True
+        if answer in valid_false:
+            return False
+        print("Invalid value. Please answer Yes/No, True/False, or equivalent.")
+
+
+def ask_session_number():
+    while True:
+        answer = input("What is the session number today? [1-10]: ").strip()
+        if answer.isdigit():
+            value = int(answer)
+            if 1 <= value <= 10:
+                return value
+        print("Invalid value. Please enter an integer between 1 and 10.")
+
+
+# ============================================================
 # MAIN CLASS
 # ============================================================
 
@@ -95,7 +165,10 @@ class MacaqueExperiment:
         logging.info("Initializing experiment and connecting to board...")
 
         try:
-            self.board = telemetrix.Telemetrix(com_port=port, arduino_wait=8)
+            self.board = telemetrix.Telemetrix(
+                com_port=port,
+                arduino_wait=8
+            )
         except Exception as e:
             logging.exception(f"Unable to connect to Arduino/Telemetrix: {e}")
             raise
@@ -103,7 +176,7 @@ class MacaqueExperiment:
         # Trial/session state
         self.in_trial = False
         self.in_iti = False
-        self.active_side = None              # "M1" or "M2"
+        self.active_side = None
         self.correct_button_pin = None
         self.correct_led_pin = None
 
@@ -135,13 +208,201 @@ class MacaqueExperiment:
         # Telemetrix motor ID
         self.motor_id = None
 
+        # Buzzer status
+        self.buzzer_ready = False
+
+        # Stimulus buzzer state
+        self.stimulus_buzzer_active = False
+        self.stimulus_buzzer_end_time_perf = None
+
+        # Correct press long buzzer state
+        self.correct_press_buzzer_active = False
+        self.correct_press_buzzer_end_time_perf = None
+        self.correct_press_buzzer_pending = False
+        self.correct_press_buzzer_start_time_perf = None
+
+        # Delayed reward scheduling state
+        self.reward_schedule_active = False
+        self.reward_target_side = None
+        self.press_perf_time = None
+
+        self.current_servo_delay_sec = None
+        self.current_stepper_delay_sec = None
+        self.current_servo_hold_sec = None
+
+        self.servo_activation_time_perf = None
+        self.stepper_activation_time_perf = None
+        self.servo_return_time_perf = None
+
+        self.servo_activated = False
+        self.stepper_activated = False
+        self.servo_returned = False
+
         self.setup_hardware()
+
+    # --------------------------------------------------------
+    # Timing configuration helpers
+    # --------------------------------------------------------
+    def get_trial_reward_timing(self):
+        """
+        Returns servo_delay_sec, stepper_delay_sec, servo_hold_sec.
+        """
+        if USE_RANDOM_REWARD_DELAYS:
+            servo_delay = random.uniform(*SERVO_DELAY_RANGE_SEC)
+            stepper_delay = random.uniform(*STEPPER_DELAY_RANGE_SEC)
+            servo_hold = random.uniform(*SERVO_HOLD_RANGE_SEC)
+        else:
+            servo_delay = SERVO_DELAY_FIXED_SEC
+            stepper_delay = STEPPER_DELAY_FIXED_SEC
+            servo_hold = SERVO_HOLD_FIXED_SEC
+
+        return servo_delay, stepper_delay, servo_hold
+
+    # --------------------------------------------------------
+    # Buzzer helpers
+    # --------------------------------------------------------
+    def start_stimulus_buzzer(self):
+        """
+        Starts the short stimulus beep in a non-blocking way.
+        """
+        if not self.buzzer_ready:
+            return
+
+        try:
+            self.board.digital_write(PIN_BUZZER, 1)
+            self.stimulus_buzzer_active = True
+            self.stimulus_buzzer_end_time_perf = (
+                time.perf_counter() + BUZZER_DURATION_MS / 1000.0
+            )
+
+            logging.info(f"Stimulus buzzer started for {BUZZER_DURATION_MS} ms")
+
+        except Exception as e:
+            logging.warning(f"Error starting stimulus buzzer: {e}")
+
+    def update_stimulus_buzzer(self):
+        """
+        Stops the short stimulus buzzer when its duration is finished.
+        """
+        if not self.stimulus_buzzer_active:
+            return
+
+        if time.perf_counter() >= self.stimulus_buzzer_end_time_perf:
+            self.stop_stimulus_buzzer()
+
+    def stop_stimulus_buzzer(self):
+        """
+        Stops the stimulus buzzer immediately.
+        """
+        if not self.stimulus_buzzer_active:
+            return
+
+        try:
+            self.board.digital_write(PIN_BUZZER, 0)
+        except Exception as e:
+            logging.warning(f"Error stopping stimulus buzzer: {e}")
+
+        self.stimulus_buzzer_active = False
+        self.stimulus_buzzer_end_time_perf = None
+
+        logging.info("Stimulus buzzer stopped.")
+
+    def start_correct_press_buzzer(self):
+        """
+        Starts a longer beep when the correct macaque presses the correct button
+        during the active stimulus window.
+
+        If the first stimulus beep is still active, it is stopped first,
+        then the long beep starts after a short silence.
+        """
+        if not self.buzzer_ready:
+            return
+
+        # If the first beep is still running, stop it and schedule a gap
+        if self.stimulus_buzzer_active:
+            self.stop_stimulus_buzzer()
+
+            self.correct_press_buzzer_pending = True
+            self.correct_press_buzzer_start_time_perf = (
+                time.perf_counter() + BUZZER_SWITCH_GAP_MS / 1000.0
+            )
+
+            logging.info(
+                f"Correct press long buzzer pending. "
+                f"Gap before start = {BUZZER_SWITCH_GAP_MS} ms"
+            )
+            return
+
+        # If there is no overlap, start the long beep immediately
+        self.start_correct_press_buzzer_now()
+
+    def start_correct_press_buzzer_now(self):
+        """
+        Starts the correct press long buzzer immediately.
+        """
+        if not self.buzzer_ready:
+            return
+
+        try:
+            self.board.digital_write(PIN_BUZZER, 1)
+
+            self.correct_press_buzzer_active = True
+            self.correct_press_buzzer_pending = False
+            self.correct_press_buzzer_start_time_perf = None
+
+            self.correct_press_buzzer_end_time_perf = (
+                time.perf_counter() + CORRECT_PRESS_BUZZER_DURATION_MS / 1000.0
+            )
+
+            logging.info(
+                f"Correct press long buzzer started for "
+                f"{CORRECT_PRESS_BUZZER_DURATION_MS} ms"
+            )
+
+        except Exception as e:
+            logging.warning(f"Error starting correct press buzzer: {e}")
+
+    def update_correct_press_buzzer(self):
+        """
+        Starts the pending correct press buzzer after the silence gap,
+        then stops it when its duration is finished.
+        """
+        # Start pending long beep after silence gap
+        if self.correct_press_buzzer_pending:
+            if time.perf_counter() >= self.correct_press_buzzer_start_time_perf:
+                self.start_correct_press_buzzer_now()
+            return
+
+        # Stop active long beep when finished
+        if not self.correct_press_buzzer_active:
+            return
+
+        if time.perf_counter() >= self.correct_press_buzzer_end_time_perf:
+            try:
+                self.board.digital_write(PIN_BUZZER, 0)
+            except Exception as e:
+                logging.warning(f"Error stopping correct press buzzer: {e}")
+
+            self.correct_press_buzzer_active = False
+            self.correct_press_buzzer_end_time_perf = None
+
+            logging.info("Correct press long buzzer stopped.")
+
+    def trigger_stimulus_cue(self, side):
+        """
+        Activates the visual stimulus and starts the short stimulus buzzer.
+        """
+        self.light_only_led_for_side(side)
+        self.start_stimulus_buzzer()
 
     # --------------------------------------------------------
     # Timestamp helper
     # --------------------------------------------------------
     def current_timestamp(self):
-        return datetime.now().isoformat(sep=" ", timespec="milliseconds")
+        return datetime.now().isoformat(
+            sep=" ",
+            timespec="milliseconds"
+        )
 
     # --------------------------------------------------------
     # Mapping helpers
@@ -164,8 +425,10 @@ class MacaqueExperiment:
     def get_reward_recipient(self):
         """
         Reward rule:
-        - If the tested macaque presses the correct button, reward goes to the tested macaque.
-        - If the tested macaque does not press the correct button, reward goes to the other macaque.
+        - If the tested macaque presses the correct button,
+          reward goes to the tested macaque.
+        - If the tested macaque does not press the correct button,
+          reward goes to the other macaque.
         """
         if self.button_pressed:
             return self.active_side
@@ -180,6 +443,7 @@ class MacaqueExperiment:
         # LEDs
         self.board.set_pin_mode_digital_output(PIN_LED_M1)
         time.sleep(0.05)
+
         self.board.set_pin_mode_digital_output(PIN_LED_M2)
         time.sleep(0.05)
 
@@ -189,6 +453,7 @@ class MacaqueExperiment:
         # Servo
         self.board.set_pin_mode_servo(PIN_SERVO, 100, 3000)
         time.sleep(0.2)
+
         self.board.servo_write(PIN_SERVO, ANGLE_CENTER)
         time.sleep(0.5)
 
@@ -208,10 +473,27 @@ class MacaqueExperiment:
         time.sleep(0.2)
 
         # Buttons with pull-up callbacks
-        self.board.set_pin_mode_digital_input_pullup(PIN_BTN_M1, callback=self.button_callback)
+        self.board.set_pin_mode_digital_input_pullup(
+            PIN_BTN_M1,
+            callback=self.button_callback
+        )
         time.sleep(0.05)
-        self.board.set_pin_mode_digital_input_pullup(PIN_BTN_M2, callback=self.button_callback)
-        time.sleep(1.0)
+
+        self.board.set_pin_mode_digital_input_pullup(
+            PIN_BTN_M2,
+            callback=self.button_callback
+        )
+        time.sleep(0.2)
+
+        # Active buzzer
+        try:
+            self.board.set_pin_mode_digital_output(PIN_BUZZER)
+            self.board.digital_write(PIN_BUZZER, 0)
+            self.buzzer_ready = True
+            logging.info(f"Active buzzer ready on pin {PIN_BUZZER}")
+        except Exception as e:
+            self.buzzer_ready = False
+            logging.warning(f"Unable to initialize the active buzzer: {e}")
 
         logging.info(f"Hardware ready. Stepper motor_id = {self.motor_id}")
 
@@ -234,8 +516,141 @@ class MacaqueExperiment:
     # --------------------------------------------------------
     def safe_sleep(self, duration_sec):
         start = time.perf_counter()
+
         while (time.perf_counter() - start) < duration_sec:
             time.sleep(0.01)
+
+    # --------------------------------------------------------
+    # Scheduled reward helpers
+    # --------------------------------------------------------
+    def reset_scheduled_reward_state(self):
+        self.reward_schedule_active = False
+        self.reward_target_side = None
+        self.press_perf_time = None
+
+        self.current_servo_delay_sec = None
+        self.current_stepper_delay_sec = None
+        self.current_servo_hold_sec = None
+
+        self.servo_activation_time_perf = None
+        self.stepper_activation_time_perf = None
+        self.servo_return_time_perf = None
+
+        self.servo_activated = False
+        self.stepper_activated = False
+        self.servo_returned = False
+
+    def schedule_delayed_reward(
+        self,
+        target_side,
+        press_perf_time,
+        servo_delay_sec,
+        stepper_delay_sec,
+        servo_hold_sec
+    ):
+        """
+        Schedules the reward components after a correct button press.
+        """
+        self.reward_schedule_active = True
+        self.reward_target_side = target_side
+        self.press_perf_time = press_perf_time
+
+        self.current_servo_delay_sec = servo_delay_sec
+        self.current_stepper_delay_sec = stepper_delay_sec
+        self.current_servo_hold_sec = servo_hold_sec
+
+        self.servo_activation_time_perf = press_perf_time + servo_delay_sec
+        self.stepper_activation_time_perf = press_perf_time + stepper_delay_sec
+        self.servo_return_time_perf = (
+            self.servo_activation_time_perf + servo_hold_sec
+        )
+
+        self.servo_activated = False
+        self.stepper_activated = False
+        self.servo_returned = False
+
+        logging.info(
+            f"Reward scheduled for {target_side} | "
+            f"servo_delay={servo_delay_sec:.3f}s | "
+            f"stepper_delay={stepper_delay_sec:.3f}s | "
+            f"servo_hold={servo_hold_sec:.3f}s"
+        )
+
+    def run_stepper_once(self):
+        """
+        Runs the stepper once and waits for completion.
+        """
+        self.stepper_done = False
+
+        self.board.stepper_move(self.motor_id, STEPS_90_DEG)
+        self.board.stepper_run(
+            self.motor_id,
+            completion_callback=self.stepper_completion_callback
+        )
+
+        start_wait = time.perf_counter()
+
+        while (
+            not self.stepper_done
+            and (time.perf_counter() - start_wait) < STEPPER_TIMEOUT_SEC
+        ):
+            time.sleep(0.02)
+
+        if not self.stepper_done:
+            logging.warning("Stepper timeout reached before completion callback.")
+
+    def update_scheduled_reward(self):
+        """
+        Non-blocking scheduler for delayed servo/stepper actions after a correct press.
+        """
+        if not self.reward_schedule_active:
+            return
+
+        now = time.perf_counter()
+
+        # Servo activation
+        if not self.servo_activated and now >= self.servo_activation_time_perf:
+            target_angle = self.servo_angle_for_side(self.reward_target_side)
+            self.board.servo_write(PIN_SERVO, target_angle)
+            self.servo_activated = True
+
+            logging.info(
+                f"Servo moved to {self.reward_target_side} | "
+                f"target_angle={target_angle} | "
+                f"delay_from_press={self.current_servo_delay_sec:.3f}s"
+            )
+
+        # Stepper activation
+        if not self.stepper_activated and now >= self.stepper_activation_time_perf:
+            self.reward_delivery_timestamp = self.current_timestamp()
+
+            logging.info(
+                f"Stepper reward triggered for {self.reward_target_side} | "
+                f"Reward_Delivery_Timestamp = {self.reward_delivery_timestamp} | "
+                f"delay_from_press={self.current_stepper_delay_sec:.3f}s"
+            )
+
+            self.run_stepper_once()
+            self.stepper_activated = True
+
+        # Servo return
+        if (
+            self.servo_activated
+            and not self.servo_returned
+            and now >= self.servo_return_time_perf
+        ):
+            self.board.servo_write(PIN_SERVO, ANGLE_CENTER)
+            self.servo_returned = True
+
+            logging.info(
+                f"Servo returned to center | "
+                f"hold_duration={self.current_servo_hold_sec:.3f}s"
+            )
+
+        # Schedule complete
+        if self.servo_activated and self.stepper_activated and self.servo_returned:
+            self.reward_schedule_active = False
+            logging.info("Scheduled reward sequence completed.")
 
     # --------------------------------------------------------
     # Button event processing
@@ -243,13 +658,15 @@ class MacaqueExperiment:
     def process_button_press(self, pin_number):
         """
         Processes a confirmed press transition on a button.
-        This function is called only when the input changes from released=1 to pressed=0.
+        This function is called only when the input changes
+        from released=1 to pressed=0.
         """
         button_event_timestamp = self.current_timestamp()
 
         logging.info(
             f"Button press transition detected on pin {pin_number} | "
-            f"in_iti={self.in_iti} | in_trial={self.in_trial} | "
+            f"in_iti={self.in_iti} | "
+            f"in_trial={self.in_trial} | "
             f"active_side={self.active_side} | "
             f"correct_button_pin={self.correct_button_pin} | "
             f"Timestamp={button_event_timestamp}"
@@ -264,19 +681,25 @@ class MacaqueExperiment:
             )
             return
 
-        # Outside trial and outside ITI => ignore for experimental scoring
+        # Outside trial => ignore for experimental scoring
         if not self.in_trial:
             return
 
-        # Store timestamp of the first button press during the trial
+        # Store timestamp of first button press during the trial
         if self.button_press_timestamp is None:
             self.button_press_timestamp = button_event_timestamp
 
-        # Correct button = same side as the tested macaque / lit LED
+        # Correct button
         if pin_number == self.correct_button_pin and not self.button_pressed:
-            self.reaction_time_ms = int((time.perf_counter() - self.trial_start_perf) * 1000)
+            self.reaction_time_ms = int(
+                (time.perf_counter() - self.trial_start_perf) * 1000
+            )
             self.button_pressed = True
             self.pressed_pin = pin_number
+
+            # If the first stimulus beep is still active, it stops it,
+            # waits BUZZER_SWITCH_GAP_MS, then starts the long beep.
+            self.start_correct_press_buzzer()
 
             logging.info(
                 f"[{self.active_side}] Correct button press detected "
@@ -287,14 +710,29 @@ class MacaqueExperiment:
             # Immediate visual feedback
             self.board.digital_write(self.correct_led_pin, 0)
 
-        # Wrong button = ignored for reward, but logged
+            # Schedule delayed reward components
+            press_perf_time = time.perf_counter()
+            servo_delay_sec, stepper_delay_sec, servo_hold_sec = (
+                self.get_trial_reward_timing()
+            )
+
+            self.schedule_delayed_reward(
+                target_side=self.active_side,
+                press_perf_time=press_perf_time,
+                servo_delay_sec=servo_delay_sec,
+                stepper_delay_sec=stepper_delay_sec,
+                servo_hold_sec=servo_hold_sec
+            )
+
+        # Wrong button
         elif pin_number != self.correct_button_pin:
             self.wrong_button_pressed = True
 
             logging.info(
                 f"[{self.active_side}] Wrong button pressed on pin {pin_number} | "
                 f"Expected correct pin = {self.correct_button_pin} | "
-                f"Button_Press_Timestamp = {button_event_timestamp} (ignored for reward)."
+                f"Button_Press_Timestamp = {button_event_timestamp} "
+                f"(ignored for reward)."
             )
 
     # --------------------------------------------------------
@@ -343,58 +781,72 @@ class MacaqueExperiment:
         logging.info(f"Trying to move the stepper by {STEPPER_TEST_STEPS} steps...")
 
         self.stepper_done = False
+
         self.board.stepper_move(self.motor_id, STEPPER_TEST_STEPS)
-        self.board.stepper_run(self.motor_id, completion_callback=self.stepper_completion_callback)
+        self.board.stepper_run(
+            self.motor_id,
+            completion_callback=self.stepper_completion_callback
+        )
 
         start_wait = time.perf_counter()
-        while not self.stepper_done and (time.perf_counter() - start_wait) < STEPPER_TIMEOUT_SEC:
+
+        while (
+            not self.stepper_done
+            and (time.perf_counter() - start_wait) < STEPPER_TIMEOUT_SEC
+        ):
             time.sleep(0.02)
 
         if self.stepper_done:
             logging.info("Stepper startup test completed successfully.")
         else:
-            logging.warning("Stepper startup test failed or timed out. Motor did not visibly move.")
+            logging.warning(
+                "Stepper startup test failed or timed out. Motor did not visibly move."
+            )
 
     # --------------------------------------------------------
-    # Reward delivery
+    # Immediate reward delivery
     # --------------------------------------------------------
-    def dispense_food(self, target_side):
+    def dispense_food_immediate(self, target_side):
+        """
+        Immediate reward delivery used for no correct press cases.
+        """
         self.reward_delivery_timestamp = self.current_timestamp()
 
         logging.info(
-            f"Dispensing food to {target_side}... | "
+            f"Dispensing immediate food to {target_side}... | "
             f"Reward_Delivery_Timestamp = {self.reward_delivery_timestamp}"
         )
 
-        # 1) Point servo to target side
         target_angle = self.servo_angle_for_side(target_side)
+
         self.board.servo_write(PIN_SERVO, target_angle)
-        time.sleep(0.8)
+        time.sleep(0.25)
 
-        # 2) Stepper quarter turn
-        self.stepper_done = False
-        self.board.stepper_move(self.motor_id, STEPS_90_DEG)
-        self.board.stepper_run(self.motor_id, completion_callback=self.stepper_completion_callback)
+        self.run_stepper_once()
 
-        start_wait = time.perf_counter()
-        while not self.stepper_done and (time.perf_counter() - start_wait) < STEPPER_TIMEOUT_SEC:
-            time.sleep(0.02)
-
-        if not self.stepper_done:
-            logging.warning("Stepper timeout reached before completion callback.")
-
-        # 3) Return servo to center
         self.board.servo_write(PIN_SERVO, ANGLE_CENTER)
-        time.sleep(0.5)
+        time.sleep(0.20)
 
     # --------------------------------------------------------
     # CSV helpers
     # --------------------------------------------------------
-    def create_session_file(self, session_id):
-        filename = f"Data_{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    def create_session_file(self, session_id, macaque_to_test, wall_present):
+        wall_status = "ON" if wall_present else "OFF"
+
+        filename = (
+            f"Data_{session_id}_"
+            f"{macaque_to_test}_"
+            f"WALL_{wall_status}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+
         self.current_csv_path = self.data_dir / filename
 
-        with self.current_csv_path.open("w", newline="", encoding="utf-8") as file:
+        with self.current_csv_path.open(
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as file:
             writer = csv.writer(file)
             writer.writerow([
                 "Trial_Start_Timestamp",
@@ -411,13 +863,27 @@ class MacaqueExperiment:
                 "Wrong_Button_Pressed",
                 "Omission",
                 "Latency_ms",
-                "Reward_Recipient"
+                "Reward_Recipient",
+                "Servo_Delay_sec",
+                "Stepper_Delay_sec",
+                "Servo_Hold_sec"
             ])
 
         logging.info(f"CSV created: {self.current_csv_path}")
 
-    def append_trial_to_csv(self, session_id, trial_num, wall_present, iti_sec, reward_recipient):
-        with self.current_csv_path.open("a", newline="", encoding="utf-8") as file:
+    def append_trial_to_csv(
+        self,
+        session_id,
+        trial_num,
+        wall_present,
+        iti_sec,
+        reward_recipient
+    ):
+        with self.current_csv_path.open(
+            "a",
+            newline="",
+            encoding="utf-8"
+        ) as file:
             writer = csv.writer(file)
             writer.writerow([
                 self.trial_start_timestamp,
@@ -434,7 +900,10 @@ class MacaqueExperiment:
                 1 if self.wrong_button_pressed else 0,
                 1 if self.omission else 0,
                 self.reaction_time_ms,
-                reward_recipient
+                reward_recipient,
+                self.current_servo_delay_sec,
+                self.current_stepper_delay_sec,
+                self.current_servo_hold_sec
             ])
 
     # --------------------------------------------------------
@@ -443,12 +912,19 @@ class MacaqueExperiment:
     def run_session(self, session_id, macaque_to_test="M1", wall_present=False):
         logging.info("")
         logging.info(f"=== STARTING SESSION: {session_id} ===")
-        logging.info(f"Target side: {macaque_to_test} | Wall present: {wall_present}")
+        logging.info(
+            f"Target side: {macaque_to_test} | "
+            f"Wall present: {wall_present}"
+        )
 
         if macaque_to_test not in ("M1", "M2"):
             raise ValueError("macaque_to_test must be 'M1' or 'M2'")
 
-        self.create_session_file(session_id)
+        self.create_session_file(
+            session_id=session_id,
+            macaque_to_test=macaque_to_test,
+            wall_present=wall_present
+        )
 
         session_start = time.time()
 
@@ -472,7 +948,8 @@ class MacaqueExperiment:
             self.in_iti = False
 
             logging.info(
-                f"ITI complete | Premature_ITI_Presses = {self.premature_iti_presses}"
+                f"ITI complete | "
+                f"Premature_ITI_Presses = {self.premature_iti_presses}"
             )
 
             # ----------------------------
@@ -493,11 +970,21 @@ class MacaqueExperiment:
             self.button_press_timestamp = None
             self.reward_delivery_timestamp = None
 
+            self.stimulus_buzzer_active = False
+            self.stimulus_buzzer_end_time_perf = None
+
+            self.correct_press_buzzer_active = False
+            self.correct_press_buzzer_end_time_perf = None
+            self.correct_press_buzzer_pending = False
+            self.correct_press_buzzer_start_time_perf = None
+
+            self.reset_scheduled_reward_state()
+
             self.trial_start_perf = time.perf_counter()
             self.in_trial = True
 
-            # Light the LED for the same side whose button must be pressed
-            self.light_only_led_for_side(self.active_side)
+            # Activate visual stimulus + short buzzer cue at trial onset
+            self.trigger_stimulus_cue(self.active_side)
 
             self.stimulus_on_timestamp = self.current_timestamp()
             self.trial_start_timestamp = self.stimulus_on_timestamp
@@ -509,33 +996,51 @@ class MacaqueExperiment:
                 f"Stimulus_ON_Timestamp = {self.stimulus_on_timestamp}"
             )
 
-            # Mandatory 10-second window
-            self.safe_sleep(TRIAL_DURATION_SEC)
+            # Trial loop
+            trial_deadline = time.perf_counter() + TRIAL_DURATION_SEC
 
-            # End of trial
+            while time.perf_counter() < trial_deadline:
+                self.update_scheduled_reward()
+                self.update_stimulus_buzzer()
+                self.update_correct_press_buzzer()
+                time.sleep(TRIAL_POLL_INTERVAL_SEC)
+
             self.in_trial = False
             self.leds_off()
 
-            # Omission = no correct and no wrong button press during the trial
-            self.omission = not self.button_pressed and not self.wrong_button_pressed
+            # Continue until scheduled reward and buzzers are finished
+            while (
+                self.reward_schedule_active
+                or self.stimulus_buzzer_active
+                or self.correct_press_buzzer_active
+                or self.correct_press_buzzer_pending
+            ):
+                self.update_scheduled_reward()
+                self.update_stimulus_buzzer()
+                self.update_correct_press_buzzer()
+                time.sleep(TRIAL_POLL_INTERVAL_SEC)
 
-            # ----------------------------
+            # Omission = no correct and no wrong button press during the trial
+            self.omission = (
+                not self.button_pressed
+                and not self.wrong_button_pressed
+            )
+
             # Reward logic
-            # Rule:
-            # - Correct press by tested macaque => reward tested macaque.
-            # - No correct press => reward other macaque.
-            # ----------------------------
             reward_recipient = self.get_reward_recipient()
 
             logging.info(
-                f"Reward decision | tested_macaque={self.active_side} | "
+                f"Reward decision | "
+                f"tested_macaque={self.active_side} | "
                 f"button_pressed={self.button_pressed} | "
                 f"wrong_button_pressed={self.wrong_button_pressed} | "
                 f"omission={self.omission} | "
                 f"reward_recipient={reward_recipient}"
             )
 
-            self.dispense_food(reward_recipient)
+            # Only deliver immediate reward if there was NO correct press
+            if not self.button_pressed:
+                self.dispense_food_immediate(reward_recipient)
 
             # Save data
             self.append_trial_to_csv(
@@ -547,7 +1052,8 @@ class MacaqueExperiment:
             )
 
             logging.info(
-                f"Trial {trial} saved | Tested side: {self.active_side} | "
+                f"Trial {trial} saved | "
+                f"Tested side: {self.active_side} | "
                 f"Correct press: {self.button_pressed} | "
                 f"Wrong press: {self.wrong_button_pressed} | "
                 f"Omission: {self.omission} | "
@@ -556,7 +1062,10 @@ class MacaqueExperiment:
                 f"Stimulus_ON_Timestamp: {self.stimulus_on_timestamp} | "
                 f"Button_Press_Timestamp: {self.button_press_timestamp} | "
                 f"Reward_Delivery_Timestamp: {self.reward_delivery_timestamp} | "
-                f"Reward given to: {reward_recipient}"
+                f"Reward given to: {reward_recipient} | "
+                f"Servo_Delay_sec: {self.current_servo_delay_sec} | "
+                f"Stepper_Delay_sec: {self.current_stepper_delay_sec} | "
+                f"Servo_Hold_sec: {self.current_servo_hold_sec}"
             )
 
         logging.info("=== SESSION COMPLETE ===")
@@ -566,11 +1075,14 @@ class MacaqueExperiment:
     # --------------------------------------------------------
     def shutdown(self):
         logging.info("Shutting down hardware safely...")
+
         try:
             self.leds_off()
+            self.board.digital_write(PIN_BUZZER, 0)
             self.board.servo_write(PIN_SERVO, ANGLE_CENTER)
             time.sleep(0.3)
             self.board.shutdown()
+
         except Exception as e:
             logging.warning(f"Ignored shutdown exception: {e}")
 
@@ -584,18 +1096,37 @@ if __name__ == "__main__":
     experiment = None
 
     try:
-        experiment = MacaqueExperiment(data_dir=data_directory, port=None)
+        macaque_to_test = ask_macaque()
+        wall_present = ask_wall_present()
+        session_number = ask_session_number()
+
+        session_id = f"SESS_{session_number:03d}"
+
+        logging.info(
+            f"Operator inputs | "
+            f"macaque_to_test={macaque_to_test} | "
+            f"wall_present={wall_present} | "
+            f"session_number={session_number} | "
+            f"session_id={session_id}"
+        )
+
+        experiment = MacaqueExperiment(
+            data_dir=data_directory,
+            port=None
+        )
 
         experiment.run_session(
-            session_id="SESS_001",
-            macaque_to_test="M1",   # Change to "M2" to test M2
-            wall_present=False
+            session_id=session_id,
+            macaque_to_test=macaque_to_test,
+            wall_present=wall_present
         )
 
     except KeyboardInterrupt:
         logging.warning("Experiment interrupted by user (Ctrl+C).")
+
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
+
     finally:
         if experiment is not None:
             experiment.shutdown()
