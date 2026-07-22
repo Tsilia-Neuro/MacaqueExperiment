@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import csv
@@ -34,6 +35,7 @@ USE_RANDOM_REWARD_DELAYS = False
 
 SERVO_DELAY_FIXED_SEC = 1.0       # Servo starts 1.0 s after correct press
 STEPPER_DELAY_FIXED_SEC = 1.2     # Stepper starts 1.2 s after correct press
+
 SERVO_HOLD_FIXED_SEC = 4.0        # Servo stays at target position for 4.0 s
 
 # Example ranges for future random delays
@@ -132,8 +134,8 @@ def ask_macaque():
 
 
 def ask_wall_present():
-    valid_true = {"YES", "Y", "TRUE", "T", "1", "OUI"}
-    valid_false = {"NO", "N", "FALSE", "F", "0", "NON"}
+    valid_true = {"YES", "Y", "TRUE", "T", "1", "YES"}
+    valid_false = {"NO", "N", "FALSE", "F", "0", "NO"}
 
     while True:
         answer = input("Is the wall present? [Yes/No]: ").strip().upper()
@@ -318,7 +320,6 @@ class MacaqueExperiment:
         if not self.buzzer_ready:
             return
 
-        # If the first beep is still running, stop it and schedule a gap
         if self.stimulus_buzzer_active:
             self.stop_stimulus_buzzer()
 
@@ -333,7 +334,6 @@ class MacaqueExperiment:
             )
             return
 
-        # If there is no overlap, start the long beep immediately
         self.start_correct_press_buzzer_now()
 
     def start_correct_press_buzzer_now(self):
@@ -367,13 +367,11 @@ class MacaqueExperiment:
         Starts the pending correct press buzzer after the silence gap,
         then stops it when its duration is finished.
         """
-        # Start pending long beep after silence gap
         if self.correct_press_buzzer_pending:
             if time.perf_counter() >= self.correct_press_buzzer_start_time_perf:
                 self.start_correct_press_buzzer_now()
             return
 
-        # Stop active long beep when finished
         if not self.correct_press_buzzer_active:
             return
 
@@ -576,9 +574,27 @@ class MacaqueExperiment:
             f"servo_hold={servo_hold_sec:.3f}s"
         )
 
+    # --------------------------------------------------------
+    # Stepper helpers
+    # --------------------------------------------------------
+    def stepper_power_off(self):
+        """
+        Turns off the stepper coils between rewards.
+        This prevents the motor from staying in holding mode.
+        """
+        try:
+            for pin in PIN_STEPPER:
+                self.board.digital_write(pin, 0)
+
+            logging.info("Stepper coils turned off between rewards.")
+
+        except Exception as e:
+            logging.warning(f"Unable to turn off stepper coils: {e}")
+
     def run_stepper_once(self):
         """
         Runs the stepper once and waits for completion.
+        Then turns off the stepper coils so the motor does not stay holding.
         """
         self.stepper_done = False
 
@@ -598,6 +614,9 @@ class MacaqueExperiment:
 
         if not self.stepper_done:
             logging.warning("Stepper timeout reached before completion callback.")
+
+        # Turn off stepper coils after each reward movement
+        self.stepper_power_off()
 
     def update_scheduled_reward(self):
         """
@@ -803,6 +822,9 @@ class MacaqueExperiment:
                 "Stepper startup test failed or timed out. Motor did not visibly move."
             )
 
+        # Turn off stepper coils after startup test
+        self.stepper_power_off()
+
     # --------------------------------------------------------
     # Immediate reward delivery
     # --------------------------------------------------------
@@ -868,6 +890,8 @@ class MacaqueExperiment:
                 "Stepper_Delay_sec",
                 "Servo_Hold_sec"
             ])
+            file.flush()
+            os.fsync(file.fileno())
 
         logging.info(f"CSV created: {self.current_csv_path}")
 
@@ -879,32 +903,47 @@ class MacaqueExperiment:
         iti_sec,
         reward_recipient
     ):
+        if self.current_csv_path is None:
+            raise RuntimeError("CSV path is not initialized. create_session_file() was not called.")
+
+        row = [
+            self.trial_start_timestamp,
+            self.stimulus_on_timestamp,
+            self.button_press_timestamp,
+            self.reward_delivery_timestamp,
+            session_id,
+            trial_num,
+            self.active_side,
+            wall_present,
+            iti_sec,
+            self.premature_iti_presses,
+            1 if self.button_pressed else 0,
+            1 if self.wrong_button_pressed else 0,
+            1 if self.omission else 0,
+            self.reaction_time_ms,
+            reward_recipient,
+            self.current_servo_delay_sec,
+            self.current_stepper_delay_sec,
+            self.current_servo_hold_sec
+        ]
+
         with self.current_csv_path.open(
             "a",
             newline="",
             encoding="utf-8"
         ) as file:
             writer = csv.writer(file)
-            writer.writerow([
-                self.trial_start_timestamp,
-                self.stimulus_on_timestamp,
-                self.button_press_timestamp,
-                self.reward_delivery_timestamp,
-                session_id,
-                trial_num,
-                self.active_side,
-                wall_present,
-                iti_sec,
-                self.premature_iti_presses,
-                1 if self.button_pressed else 0,
-                1 if self.wrong_button_pressed else 0,
-                1 if self.omission else 0,
-                self.reaction_time_ms,
-                reward_recipient,
-                self.current_servo_delay_sec,
-                self.current_stepper_delay_sec,
-                self.current_servo_hold_sec
-            ])
+            writer.writerow(row)
+
+            # Force immediate write to disk
+            file.flush()
+            os.fsync(file.fileno())
+
+        logging.info(
+            f"CSV row appended and flushed | "
+            f"Trial={trial_num} | "
+            f"CSV={self.current_csv_path}"
+        )
 
     # --------------------------------------------------------
     # Main session logic
@@ -926,6 +965,9 @@ class MacaqueExperiment:
             wall_present=wall_present
         )
 
+        logging.info(f"CSV absolute path: {self.current_csv_path.resolve()}")
+        logging.info(f"CSV exists after creation: {self.current_csv_path.exists()}")
+
         session_start = time.time()
 
         for trial in range(1, NUM_TRIALS + 1):
@@ -933,140 +975,204 @@ class MacaqueExperiment:
                 logging.warning("Session duration limit reached.")
                 break
 
-            # ----------------------------
-            # ITI
-            # ----------------------------
-            iti_sec = random.randint(MIN_ITI, MAX_ITI)
-            self.premature_iti_presses = 0
-            self.in_iti = True
+            trial_saved = False
+            iti_sec = None
+            reward_recipient = None
 
-            logging.info(f"--- Trial {trial}/{NUM_TRIALS} ---")
-            logging.info(f"ITI = {iti_sec} s")
+            try:
+                # ----------------------------
+                # ITI
+                # ----------------------------
+                iti_sec = random.randint(MIN_ITI, MAX_ITI)
+                self.premature_iti_presses = 0
+                self.in_iti = True
 
-            self.safe_sleep(iti_sec)
+                logging.info(f"--- Trial {trial}/{NUM_TRIALS} ---")
+                logging.info(f"ITI = {iti_sec} s")
 
-            self.in_iti = False
+                self.safe_sleep(iti_sec)
 
-            logging.info(
-                f"ITI complete | "
-                f"Premature_ITI_Presses = {self.premature_iti_presses}"
-            )
+                self.in_iti = False
 
-            # ----------------------------
-            # Trial init
-            # ----------------------------
-            self.active_side = macaque_to_test
-            self.correct_button_pin = self.button_pin_for_side(self.active_side)
-            self.correct_led_pin = self.led_pin_for_side(self.active_side)
+                logging.info(
+                    f"ITI complete | "
+                    f"Premature_ITI_Presses = {self.premature_iti_presses}"
+                )
 
-            self.button_pressed = False
-            self.wrong_button_pressed = False
-            self.omission = False
-            self.pressed_pin = None
-            self.reaction_time_ms = int(TRIAL_DURATION_SEC * 1000)
+                # ----------------------------
+                # Trial init
+                # ----------------------------
+                self.active_side = macaque_to_test
+                self.correct_button_pin = self.button_pin_for_side(self.active_side)
+                self.correct_led_pin = self.led_pin_for_side(self.active_side)
 
-            self.trial_start_timestamp = None
-            self.stimulus_on_timestamp = None
-            self.button_press_timestamp = None
-            self.reward_delivery_timestamp = None
+                self.button_pressed = False
+                self.wrong_button_pressed = False
+                self.omission = False
+                self.pressed_pin = None
+                self.reaction_time_ms = int(TRIAL_DURATION_SEC * 1000)
 
-            self.stimulus_buzzer_active = False
-            self.stimulus_buzzer_end_time_perf = None
+                self.trial_start_timestamp = None
+                self.stimulus_on_timestamp = None
+                self.button_press_timestamp = None
+                self.reward_delivery_timestamp = None
 
-            self.correct_press_buzzer_active = False
-            self.correct_press_buzzer_end_time_perf = None
-            self.correct_press_buzzer_pending = False
-            self.correct_press_buzzer_start_time_perf = None
+                self.stimulus_buzzer_active = False
+                self.stimulus_buzzer_end_time_perf = None
 
-            self.reset_scheduled_reward_state()
+                self.correct_press_buzzer_active = False
+                self.correct_press_buzzer_end_time_perf = None
+                self.correct_press_buzzer_pending = False
+                self.correct_press_buzzer_start_time_perf = None
 
-            self.trial_start_perf = time.perf_counter()
-            self.in_trial = True
+                self.reset_scheduled_reward_state()
 
-            # Activate visual stimulus + short buzzer cue at trial onset
-            self.trigger_stimulus_cue(self.active_side)
+                self.trial_start_perf = time.perf_counter()
+                self.in_trial = True
 
-            self.stimulus_on_timestamp = self.current_timestamp()
-            self.trial_start_timestamp = self.stimulus_on_timestamp
+                # Activate visual stimulus + short buzzer cue at trial onset
+                self.trigger_stimulus_cue(self.active_side)
 
-            logging.info(
-                f"Stimulus ON. Tested side = {self.active_side} | "
-                f"LED side = {self.active_side} | "
-                f"Correct button pin = {self.correct_button_pin} | "
-                f"Stimulus_ON_Timestamp = {self.stimulus_on_timestamp}"
-            )
+                self.stimulus_on_timestamp = self.current_timestamp()
+                self.trial_start_timestamp = self.stimulus_on_timestamp
 
-            # Trial loop
-            trial_deadline = time.perf_counter() + TRIAL_DURATION_SEC
+                logging.info(
+                    f"Stimulus ON. Tested side = {self.active_side} | "
+                    f"LED side = {self.active_side} | "
+                    f"Correct button pin = {self.correct_button_pin} | "
+                    f"Stimulus_ON_Timestamp = {self.stimulus_on_timestamp}"
+                )
 
-            while time.perf_counter() < trial_deadline:
-                self.update_scheduled_reward()
-                self.update_stimulus_buzzer()
-                self.update_correct_press_buzzer()
-                time.sleep(TRIAL_POLL_INTERVAL_SEC)
+                # Trial loop
+                trial_deadline = time.perf_counter() + TRIAL_DURATION_SEC
 
-            self.in_trial = False
-            self.leds_off()
+                while time.perf_counter() < trial_deadline:
+                    self.update_scheduled_reward()
+                    self.update_stimulus_buzzer()
+                    self.update_correct_press_buzzer()
+                    time.sleep(TRIAL_POLL_INTERVAL_SEC)
 
-            # Continue until scheduled reward and buzzers are finished
-            while (
-                self.reward_schedule_active
-                or self.stimulus_buzzer_active
-                or self.correct_press_buzzer_active
-                or self.correct_press_buzzer_pending
-            ):
-                self.update_scheduled_reward()
-                self.update_stimulus_buzzer()
-                self.update_correct_press_buzzer()
-                time.sleep(TRIAL_POLL_INTERVAL_SEC)
+                self.in_trial = False
+                self.leds_off()
 
-            # Omission = no correct and no wrong button press during the trial
-            self.omission = (
-                not self.button_pressed
-                and not self.wrong_button_pressed
-            )
+                # Continue until scheduled reward and buzzers are finished
+                while (
+                    self.reward_schedule_active
+                    or self.stimulus_buzzer_active
+                    or self.correct_press_buzzer_active
+                    or self.correct_press_buzzer_pending
+                ):
+                    self.update_scheduled_reward()
+                    self.update_stimulus_buzzer()
+                    self.update_correct_press_buzzer()
+                    time.sleep(TRIAL_POLL_INTERVAL_SEC)
 
-            # Reward logic
-            reward_recipient = self.get_reward_recipient()
+                # Omission = no correct and no wrong button press during the trial
+                self.omission = (
+                    not self.button_pressed
+                    and not self.wrong_button_pressed
+                )
 
-            logging.info(
-                f"Reward decision | "
-                f"tested_macaque={self.active_side} | "
-                f"button_pressed={self.button_pressed} | "
-                f"wrong_button_pressed={self.wrong_button_pressed} | "
-                f"omission={self.omission} | "
-                f"reward_recipient={reward_recipient}"
-            )
+                # Reward logic
+                reward_recipient = self.get_reward_recipient()
 
-            # Only deliver immediate reward if there was NO correct press
-            if not self.button_pressed:
-                self.dispense_food_immediate(reward_recipient)
+                logging.info(
+                    f"Reward decision | "
+                    f"tested_macaque={self.active_side} | "
+                    f"button_pressed={self.button_pressed} | "
+                    f"wrong_button_pressed={self.wrong_button_pressed} | "
+                    f"omission={self.omission} | "
+                    f"reward_recipient={reward_recipient}"
+                )
 
-            # Save data
-            self.append_trial_to_csv(
-                session_id=session_id,
-                trial_num=trial,
-                wall_present=wall_present,
-                iti_sec=iti_sec,
-                reward_recipient=reward_recipient
-            )
+                # Only deliver immediate reward if there was NO correct press
+                if not self.button_pressed:
+                    self.dispense_food_immediate(reward_recipient)
 
-            logging.info(
-                f"Trial {trial} saved | "
-                f"Tested side: {self.active_side} | "
-                f"Correct press: {self.button_pressed} | "
-                f"Wrong press: {self.wrong_button_pressed} | "
-                f"Omission: {self.omission} | "
-                f"Premature ITI presses: {self.premature_iti_presses} | "
-                f"Latency: {self.reaction_time_ms} ms | "
-                f"Stimulus_ON_Timestamp: {self.stimulus_on_timestamp} | "
-                f"Button_Press_Timestamp: {self.button_press_timestamp} | "
-                f"Reward_Delivery_Timestamp: {self.reward_delivery_timestamp} | "
-                f"Reward given to: {reward_recipient} | "
-                f"Servo_Delay_sec: {self.current_servo_delay_sec} | "
-                f"Stepper_Delay_sec: {self.current_stepper_delay_sec} | "
-                f"Servo_Hold_sec: {self.current_servo_hold_sec}"
-            )
+            except KeyboardInterrupt:
+                logging.warning(f"Trial {trial} interrupted by user Ctrl+C.")
+
+                self.in_trial = False
+                self.in_iti = False
+
+                try:
+                    self.leds_off()
+                except Exception:
+                    pass
+
+                self.omission = (
+                    not self.button_pressed
+                    and not self.wrong_button_pressed
+                )
+
+                if reward_recipient is None and self.active_side is not None:
+                    reward_recipient = self.get_reward_recipient()
+
+                # The finally block below will save the current trial before exit.
+                raise
+
+            except Exception as e:
+                logging.exception(f"Error during trial {trial}: {e}")
+
+                self.in_trial = False
+                self.in_iti = False
+
+                try:
+                    self.leds_off()
+                except Exception:
+                    pass
+
+                self.omission = (
+                    not self.button_pressed
+                    and not self.wrong_button_pressed
+                )
+
+                if reward_recipient is None and self.active_side is not None:
+                    reward_recipient = self.get_reward_recipient()
+
+            finally:
+                if reward_recipient is None:
+                    reward_recipient = "UNKNOWN"
+
+                if iti_sec is None:
+                    iti_sec = ""
+
+                try:
+                    self.append_trial_to_csv(
+                        session_id=session_id,
+                        trial_num=trial,
+                        wall_present=wall_present,
+                        iti_sec=iti_sec,
+                        reward_recipient=reward_recipient
+                    )
+
+                    trial_saved = True
+
+                    logging.info(
+                        f"Trial {trial} saved | "
+                        f"Tested side: {self.active_side} | "
+                        f"Correct press: {self.button_pressed} | "
+                        f"Wrong press: {self.wrong_button_pressed} | "
+                        f"Omission: {self.omission} | "
+                        f"Premature ITI presses: {self.premature_iti_presses} | "
+                        f"Latency: {self.reaction_time_ms} ms | "
+                        f"Stimulus_ON_Timestamp: {self.stimulus_on_timestamp} | "
+                        f"Button_Press_Timestamp: {self.button_press_timestamp} | "
+                        f"Reward_Delivery_Timestamp: {self.reward_delivery_timestamp} | "
+                        f"Reward given to: {reward_recipient} | "
+                        f"Servo_Delay_sec: {self.current_servo_delay_sec} | "
+                        f"Stepper_Delay_sec: {self.current_stepper_delay_sec} | "
+                        f"Servo_Hold_sec: {self.current_servo_hold_sec}"
+                    )
+
+                    logging.info(f"CSV exists after append: {self.current_csv_path.exists()}")
+                    logging.info(f"CSV size after append: {self.current_csv_path.stat().st_size} bytes")
+
+                except Exception as e:
+                    logging.exception(f"CRITICAL: could not save trial {trial} to CSV: {e}")
+
+            if not trial_saved:
+                logging.warning(f"Trial {trial} was not saved correctly.")
 
         logging.info("=== SESSION COMPLETE ===")
 
@@ -1079,6 +1185,7 @@ class MacaqueExperiment:
         try:
             self.leds_off()
             self.board.digital_write(PIN_BUZZER, 0)
+            self.stepper_power_off()
             self.board.servo_write(PIN_SERVO, ANGLE_CENTER)
             time.sleep(0.3)
             self.board.shutdown()
